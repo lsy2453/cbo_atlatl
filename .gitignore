@@ -20,6 +20,8 @@ Thumbs.db
 # Experiment outputs
 results.json
 comparison_results.json
+smoke_results.json
+paper_atlatl.txt
 *.log
 
 # Local archives and packaged snapshots

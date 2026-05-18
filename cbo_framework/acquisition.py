@@ -1,100 +1,87 @@
 """
-Causal acquisition function for minimax CBO with do-calculus.
+Acquisition functions and candidate generation for single-level CBO.
 
-Problem: max_d min_u E[y | do(d), do(u)]
+The objective is minimization:
 
-Key fixes from previous version:
-1. Uses do_d_worst_u for inner minimization (proper do-calculus)
-2. Acquisition compares robust values across d candidates (not against
-   an inflated global best)
-3. Exploration term is pathway-specific uncertainty, not generic variance
+    x* = argmin_x E[y | do(x)]
 """
 
 import numpy as np
 from scipy.stats import norm
-from atlatl_evaluator import D_INDICES, U_INDICES
+
+import config
+from atlatl_evaluator import N_DIM, vector_to_vars, vars_to_vector
 
 
-def minimax_acquisition(gp, d_candidates, u_candidates, y_observed,
-                         dag=None, beta_inner=1.5, beta_explore=0.5):
+def expected_improvement_min(gp, x_candidates, y_observed, xi=0.01):
     """
-    Minimax CBO acquisition with do-calculus.
+    Expected improvement for minimization.
 
-    For each candidate d_i:
-      1. Inner loop: find worst u via do_d_worst_u (adversarial do-calculus)
-         u*_i = argmin_u  LCB[y | do(d_i), do(u)]
-      2. Compute robust value: R(d_i) = LCB[y | do(d_i), do(u*_i)]
-
-    Then select d with highest: R(d) + beta_explore * sigma(d, u*)
-    This balances exploitation (high robust value) and exploration
-    (high uncertainty at the worst-case point).
-
-    Returns
-    -------
-    best_d_idx, best_u_idx, acq_values_for_all_d
+    EI(x) = E[max(y_best - Y(x) - xi, 0)]
     """
-    n_d = len(d_candidates)
-    robust_values = np.zeros(n_d)
-    worst_u_indices = np.zeros(n_d, dtype=int)
-    uncertainties = np.zeros(n_d)
-
-    dim = len(D_INDICES) + len(U_INDICES)
-
-    for i in range(n_d):
-        # do-calculus: min_u E[y | do(d_i), do(u)]
-        worst_idx, worst_lcb, all_lcb = gp.do_d_worst_u(
-            d_candidates[i], u_candidates, beta=beta_inner
-        )
-        worst_u_indices[i] = worst_idx
-        robust_values[i] = worst_lcb
-
-        # Uncertainty at the worst-case point (for exploration)
-        x_worst = np.zeros(dim)
-        x_worst[D_INDICES] = d_candidates[i]
-        x_worst[U_INDICES] = u_candidates[worst_idx]
-        _, var = gp.predict(x_worst.reshape(1, -1))
-        uncertainties[i] = np.sqrt(var[0])
-
-    # Combined acquisition: robust value + exploration bonus
-    # Normalize both to [0, 1]
-    r_min, r_max = robust_values.min(), robust_values.max()
-    if r_max > r_min:
-        r_norm = (robust_values - r_min) / (r_max - r_min)
-    else:
-        r_norm = np.zeros(n_d)
-
-    u_min, u_max = uncertainties.min(), uncertainties.max()
-    if u_max > u_min:
-        u_norm = (uncertainties - u_min) / (u_max - u_min)
-    else:
-        u_norm = np.zeros(n_d)
-
-    acq = (1 - beta_explore) * r_norm + beta_explore * u_norm
-
-    best_d_idx = np.argmax(acq)
-    best_u_idx = worst_u_indices[best_d_idx]
-
-    return int(best_d_idx), int(best_u_idx), acq
+    mu, var = gp.predict(x_candidates)
+    sigma = np.sqrt(np.maximum(var, 1e-12))
+    y_best = float(np.min(y_observed))
+    improvement = y_best - mu - xi
+    z = improvement / sigma
+    ei = improvement * norm.cdf(z) + sigma * norm.pdf(z)
+    ei[sigma <= 1e-12] = 0.0
+    return ei
 
 
-def generate_d_candidates(n_samples, rng=None):
+def select_ei_candidate(gp, x_candidates, y_observed, xi=0.01):
+    ei = expected_improvement_min(gp, x_candidates, y_observed, xi=xi)
+    idx = int(np.argmax(ei))
+    return idx, ei
+
+
+def _sample_terrain_probs(rng):
+    """Sample terrain probabilities subject to p_urban+p_rough+p_marsh <= 1."""
+    for _ in range(100):
+        p_urban = rng.uniform(0.0, 0.5)
+        p_rough = rng.uniform(0.0, 0.5)
+        p_marsh = rng.uniform(0.0, 0.3)
+        if p_urban + p_rough + p_marsh <= 1.0:
+            return p_urban, p_rough, p_marsh
+    vals = np.array([
+        rng.uniform(0.0, 0.5),
+        rng.uniform(0.0, 0.5),
+        rng.uniform(0.0, 0.3),
+    ])
+    vals = vals / max(vals.sum(), 1.0)
+    return vals.tolist()
+
+
+def generate_x_candidates(n_samples, rng=None):
+    """Generate mixed discrete/continuous scenario candidates."""
     if rng is None:
         rng = np.random.RandomState()
-    c = np.zeros((n_samples, len(D_INDICES)))
-    c[:, 0] = rng.randint(1, 5, n_samples)  # n_blue: 1-4
-    c[:, 1] = rng.randint(0, 4, n_samples)  # blue_side: 0-3
-    return c
+
+    candidates = np.zeros((n_samples, N_DIM), dtype=np.float64)
+    for i in range(n_samples):
+        x_vars = {
+            "n_blue": int(rng.randint(1, 5)),
+            "blue_side": config.SIDE_CATEGORIES[int(rng.randint(0, 4))],
+            "blue_unit_type": config.UNIT_TYPE_CATEGORIES[int(rng.randint(0, 4))],
+            "n_red": int(rng.randint(1, 5)),
+            "red_ai": config.AI_CATEGORIES[int(rng.randint(0, 4))],
+            "max_phases": int(rng.randint(6, 21)),
+            "red_unit_type": config.UNIT_TYPE_CATEGORIES[int(rng.randint(0, 4))],
+        }
+        p_urban, p_rough, p_marsh = _sample_terrain_probs(rng)
+        x_vars["p_urban"] = p_urban
+        x_vars["p_rough"] = p_rough
+        x_vars["p_marsh"] = p_marsh
+        candidates[i] = vars_to_vector(x_vars)
+    return candidates
 
 
-def generate_u_candidates(n_samples, rng=None):
-    if rng is None:
-        rng = np.random.RandomState()
-    c = np.zeros((n_samples, len(U_INDICES)))
-    c[:, 0] = rng.randint(1, 5, n_samples)     # n_red
-    c[:, 1] = rng.randint(0, 4, n_samples)     # red_ai
-    c[:, 2] = rng.randint(6, 21, n_samples)    # max_phases
-    c[:, 3] = rng.uniform(0, 0.5, n_samples)   # p_urban
-    c[:, 4] = rng.uniform(0, 0.5, n_samples)   # p_rough
-    c[:, 5] = rng.uniform(0, 0.3, n_samples)   # p_marsh
-    c[:, 6] = rng.uniform(0, 1, n_samples)     # seed
-    return c
+def generate_reference_samples(n_samples, rng=None):
+    """Monte Carlo reference distribution for intervention analysis."""
+    return generate_x_candidates(n_samples, rng=rng)
+
+
+# Backward-compatible aliases for older imports.
+minimax_acquisition = None
+generate_d_candidates = generate_x_candidates
+generate_u_candidates = generate_x_candidates

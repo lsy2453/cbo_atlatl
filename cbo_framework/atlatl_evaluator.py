@@ -1,49 +1,53 @@
 """
 Direct synchronous evaluator for Atlatl games.
-Bypasses the async server/websocket architecture.
-Runs Game + AI.process() in a simple loop.
+
+This module maps a 10-dimensional scenario vector x into an Atlatl scenario,
+runs the fixed Blue AI against the selected Red AI, and returns the Blue score.
 """
 
-import sys
-import os
 import json
+import os
 import random
-import copy
+import sys
+import types
+
 import numpy as np
 
-# Add Atlatl server to path
-# When run via run.py, path is already set.
-# When run standalone, use config.
 import config
+
 _atlatl_path = config.ATLATL_SERVER_PATH
 if _atlatl_path not in sys.path:
     sys.path.insert(0, _atlatl_path)
 
 import map as atlatl_map
 import unit as atlatl_unit
-import combat
-import mobility
 from game import Game
-import config
+
+try:
+    import websockets  # noqa: F401
+except ModuleNotFoundError:
+    # The synchronous evaluator never uses the websocket client helpers in
+    # Atlatl AI modules, but several modules import websockets at top level.
+    sys.modules["websockets"] = types.SimpleNamespace(connect=None)
 
 
-def create_scenario(n_blue, blue_side, n_red, max_phases,
-                    p_urban, p_rough, p_marsh, scenario_seed,
+def create_scenario(n_blue, blue_side, blue_unit_type, n_red, red_unit_type,
+                    max_phases, p_urban, p_rough, p_marsh, scenario_seed,
                     map_size=None):
     """
-    Generate an Atlatl scenario dict from CBO parameters.
-    Returns a scenario dict compatible with Game().
+    Generate an Atlatl scenario dict from scenario parameters.
+
+    The terrain probabilities are interpreted in order urban -> rough -> marsh
+    -> clear. Candidate generation enforces p_urban + p_rough + p_marsh <= 1.
     """
     if map_size is None:
         map_size = config.MAP_SIZE
 
     rng = random.Random(scenario_seed)
 
-    # Build hex grid
     mapData = atlatl_map.MapData()
     mapData.createHexGrid(map_size, map_size)
 
-    # Assign terrain based on probabilities
     for hex_obj in mapData.hexes():
         r = rng.random()
         if r < p_urban:
@@ -52,59 +56,54 @@ def create_scenario(n_blue, blue_side, n_red, max_phases,
             hex_obj.terrain = "rough"
         elif r < p_urban + p_rough + p_marsh:
             hex_obj.terrain = "marsh"
-        # else: stays "clear" (default)
 
-    # Determine sides
     side_map = {
-        "north": "south", "south": "north",
-        "east": "west", "west": "east"
+        "north": "south",
+        "south": "north",
+        "east": "west",
+        "west": "east",
     }
     red_side = side_map[blue_side]
 
-    # Get setup hexes for each side
     blue_hexes = _get_setup_hexes(map_size, blue_side)
     red_hexes = _get_setup_hexes(map_size, red_side)
 
-    # Place units
     unitData = atlatl_unit.UnitData()
 
-    def place_units(faction, hexes, count):
+    def place_units(faction, unit_type, hexes, count):
         available = list(hexes)
         rng.shuffle(available)
         placed = min(count, len(available))
         for i in range(placed):
-            hex_id = available[i]
             u_param = {
-                "hex": hex_id,
-                "type": "infantry",
+                "hex": available[i],
+                "type": unit_type,
                 "longName": str(i),
                 "faction": faction,
-                "currentStrength": 100
+                "currentStrength": 100,
             }
             atlatl_unit.Unit(u_param, unitData, mapData)
 
-    place_units("blue", blue_hexes, n_blue)
-    place_units("red", red_hexes, n_red)
-
-    score_params = {
-        "maxPhases": max_phases,
-        "lossPenalty": -2,
-        "cityScore": 24
-    }
+    place_units("blue", blue_unit_type, blue_hexes, n_blue)
+    place_units("red", red_unit_type, red_hexes, n_red)
 
     scenario = {
         "map": mapData.toPortable(),
         "units": unitData.toPortable(),
-        "score": score_params
+        "score": {
+            "maxPhases": max_phases,
+            "lossPenalty": -2,
+            "cityScore": 24,
+        },
     }
     scenario["map"]["fogOfWar"] = False
-
     return scenario
 
 
 def _get_setup_hexes(size, side, margin=1):
     """Get valid hex IDs for a deployment side."""
     import math
+
     low = math.floor(size / 2) - margin
     high = math.floor(size / 2) + margin
     hexes = []
@@ -128,27 +127,26 @@ def _get_setup_hexes(size, side, margin=1):
 
 
 def _create_ai(ai_name, role):
-    """Instantiate an AI by name from the registry."""
-    # Import AI classes directly to avoid full registry import
+    """Instantiate an AI by name from the Atlatl AI modules."""
     if ai_name == "passive":
         from ai.passive import AI
         return AI(role, {})
-    elif ai_name == "shootback":
+    if ai_name == "shootback":
         from ai.shootback import AI
         return AI(role, {})
-    elif ai_name == "pass-agg":
+    if ai_name == "pass-agg":
         from ai.pass_agg import AI
         return AI(role, {})
-    elif ai_name == "agg":
+    if ai_name == "agg":
         from ai.pass_agg import AI
         return AI(role, {"mode": "agg"})
-    elif ai_name == "pass":
+    if ai_name == "pass":
         from ai.pass_agg import AI
         return AI(role, {"mode": "pass"})
-    elif ai_name == "random":
+    if ai_name == "random":
         from ai.random_actor import AI
         return AI(role, {})
-    elif ai_name.startswith("llm"):
+    if ai_name.startswith("llm"):
         from llm_ai import LLM_AI
         kwargs = {"backend": "mock"}
         if ai_name == "llm-claude":
@@ -156,104 +154,67 @@ def _create_ai(ai_name, role):
         elif ai_name == "llm-openai":
             kwargs = {"backend": "openai"}
         return LLM_AI(role, kwargs)
-    else:
-        raise ValueError(f"Unknown AI: {ai_name}")
+    raise ValueError(f"Unknown AI: {ai_name}")
 
 
 def run_game(scenario, blue_ai_name, red_ai_name):
-    """
-    Run a single Atlatl game synchronously.
-    Returns the final score (from Blue's perspective).
-    """
+    """Run a single Atlatl game synchronously and return the Blue score."""
     game = Game(scenario)
     state = game.initial_state()
 
-    # Create AI instances
     blue_ai = _create_ai(blue_ai_name, "blue")
     red_ai = _create_ai(red_ai_name, "red")
 
-    # Send parameters to AIs
-    param_msg = json.dumps({
-        "type": "parameters",
-        "parameters": scenario
-    })
+    param_msg = json.dumps({"type": "parameters", "parameters": scenario})
     blue_ai.process(param_msg)
     red_ai.process(param_msg)
 
-    # Game loop
     while not game.is_terminal(state):
         on_move = game.on_move(state)
-
-        if on_move == "blue":
-            ai = blue_ai
-        else:
-            ai = red_ai
-
-        # Create observation message
+        ai = blue_ai if on_move == "blue" else red_ai
         obs = game.observation(state, on_move)
         obs_msg = json.dumps({"type": "observation", "observation": obs})
-
-        # Get AI response
         response_str = ai.process(obs_msg)
         if response_str is None:
-            # AI chose not to respond (terminal or not on move)
             action = {"type": "pass"}
         else:
             response = json.loads(response_str)
             action = response.get("action", {"type": "pass"})
-
-        # Transition game state
         state = game.transition(state, action)
 
     return game.score(state)
 
 
-def evaluate(d_vars, u_vars, n_seeds=None):
+def evaluate(x_vars, n_seeds=None, base_seed=None):
     """
-    Evaluate a (d, u) configuration.
-    Runs multiple games with different seeds and returns statistics.
+    Evaluate a scenario configuration x.
 
-    Parameters
-    ----------
-    d_vars : dict
-        Decision variables: {n_blue, blue_side}
-    u_vars : dict
-        Adversarial variables: {n_red, red_ai, max_phases,
-                                 p_urban, p_rough, p_marsh, scenario_seed}
-    n_seeds : int
-        Number of evaluation seeds to average over.
-
-    Returns
-    -------
-    dict with keys: mean, std, scores, individual results
+    scenario_seed is treated as an exogenous Monte Carlo seed, not an optimized
+    scenario coordinate. The returned mean estimates E[y | do(x)].
     """
     if n_seeds is None:
         n_seeds = config.N_EVAL_SEEDS
-
-    blue_ai_name = config.BLUE_AI
-    red_ai_name = u_vars["red_ai"]
+    if base_seed is None:
+        base_seed = config.BASE_SCENARIO_SEED
 
     scores = []
-    base_seed = u_vars.get("scenario_seed", 42)
-
     for i in range(n_seeds):
         seed = base_seed + i * 1000
-
         scenario = create_scenario(
-            n_blue=d_vars["n_blue"],
-            blue_side=d_vars["blue_side"],
-            n_red=u_vars["n_red"],
-            max_phases=u_vars["max_phases"],
-            p_urban=u_vars["p_urban"],
-            p_rough=u_vars["p_rough"],
-            p_marsh=u_vars["p_marsh"],
+            n_blue=x_vars["n_blue"],
+            blue_side=x_vars["blue_side"],
+            blue_unit_type=x_vars["blue_unit_type"],
+            n_red=x_vars["n_red"],
+            red_unit_type=x_vars["red_unit_type"],
+            max_phases=x_vars["max_phases"],
+            p_urban=x_vars["p_urban"],
+            p_rough=x_vars["p_rough"],
+            p_marsh=x_vars["p_marsh"],
             scenario_seed=seed,
         )
+        scores.append(run_game(scenario, config.BLUE_AI, x_vars["red_ai"]))
 
-        score = run_game(scenario, blue_ai_name, red_ai_name)
-        scores.append(score)
-
-    scores = np.array(scores)
+    scores = np.array(scores, dtype=np.float64)
     return {
         "mean": float(np.mean(scores)),
         "std": float(np.std(scores)),
@@ -262,63 +223,94 @@ def evaluate(d_vars, u_vars, n_seeds=None):
     }
 
 
-def vars_to_vector(d_vars, u_vars):
-    """Convert variable dicts to a numeric vector for GP."""
-    # Encode categoricals as integers
-    side_map = {"north": 0, "south": 1, "east": 2, "west": 3}
-    ai_map = {"passive": 0, "shootback": 1, "pass-agg": 2, "agg": 3}
+def _cat_to_index(value, categories):
+    return categories.index(value)
 
-    vec = [
-        d_vars["n_blue"],
-        side_map[d_vars["blue_side"]],
-        u_vars["n_red"],
-        ai_map[u_vars["red_ai"]],
-        u_vars["max_phases"],
-        u_vars["p_urban"],
-        u_vars["p_rough"],
-        u_vars["p_marsh"],
-        u_vars["scenario_seed"] / 99999.0,  # normalize
-    ]
-    return np.array(vec, dtype=np.float64)
+
+def _index_to_cat(value, categories):
+    idx = int(round(float(value)))
+    idx = min(max(idx, 0), len(categories) - 1)
+    return categories[idx]
+
+
+def vars_to_vector(x_vars):
+    """Convert scenario variable dict to a numeric vector for GP modeling."""
+    return np.array([
+        x_vars["n_blue"],
+        _cat_to_index(x_vars["blue_side"], config.SIDE_CATEGORIES),
+        _cat_to_index(x_vars["blue_unit_type"], config.UNIT_TYPE_CATEGORIES),
+        x_vars["n_red"],
+        _cat_to_index(x_vars["red_ai"], config.AI_CATEGORIES),
+        x_vars["max_phases"],
+        x_vars["p_urban"],
+        x_vars["p_rough"],
+        x_vars["p_marsh"],
+        _cat_to_index(x_vars["red_unit_type"], config.UNIT_TYPE_CATEGORIES),
+    ], dtype=np.float64)
 
 
 def vector_to_vars(vec):
-    """Convert numeric vector back to variable dicts."""
-    side_list = ["north", "south", "east", "west"]
-    ai_list = ["passive", "shootback", "pass-agg", "agg"]
+    """Convert a numeric vector back to typed scenario variables."""
+    vec = np.asarray(vec, dtype=np.float64)
+    p_urban = float(np.clip(vec[6], 0.0, 0.5))
+    p_rough = float(np.clip(vec[7], 0.0, 0.5))
+    p_marsh = float(np.clip(vec[8], 0.0, 0.3))
+    total = p_urban + p_rough + p_marsh
+    if total > 1.0:
+        p_urban, p_rough, p_marsh = [
+            p_urban / total,
+            p_rough / total,
+            p_marsh / total,
+        ]
 
-    d_vars = {
-        "n_blue": int(round(vec[0])),
-        "blue_side": side_list[int(round(vec[1]))],
+    return {
+        "n_blue": int(np.clip(round(vec[0]), 1, 4)),
+        "blue_side": _index_to_cat(vec[1], config.SIDE_CATEGORIES),
+        "blue_unit_type": _index_to_cat(vec[2], config.UNIT_TYPE_CATEGORIES),
+        "n_red": int(np.clip(round(vec[3]), 1, 4)),
+        "red_ai": _index_to_cat(vec[4], config.AI_CATEGORIES),
+        "max_phases": int(np.clip(round(vec[5]), 6, 20)),
+        "p_urban": p_urban,
+        "p_rough": p_rough,
+        "p_marsh": p_marsh,
+        "red_unit_type": _index_to_cat(vec[9], config.UNIT_TYPE_CATEGORIES),
     }
-    u_vars = {
-        "n_red": int(round(vec[2])),
-        "red_ai": ai_list[int(round(vec[3]))],
-        "max_phases": int(round(vec[4])),
-        "p_urban": float(vec[5]),
-        "p_rough": float(vec[6]),
-        "p_marsh": float(vec[7]),
-        "scenario_seed": int(round(vec[8] * 99999)),
-    }
-    return d_vars, u_vars
 
 
-# Variable indices for kernel decomposition
-D_INDICES = [0, 1]           # n_blue, blue_side
-U_INDICES = [2, 3, 4, 5, 6, 7, 8]  # n_red, red_ai, max_phases, p_*, seed
-FORCE_INDICES = [0, 2]       # n_blue, n_red (force ratio group)
-TERRAIN_INDICES = [5, 6, 7]  # p_urban, p_rough, p_marsh
-AI_INDEX = 3                 # red_ai
-PHASE_INDEX = 4              # max_phases
+N_DIM = len(config.VAR_NAMES)
+X_INDICES = list(range(N_DIM))
+FORCE_INDICES = [
+    config.VAR_INDICES["n_blue"],
+    config.VAR_INDICES["blue_unit_type"],
+    config.VAR_INDICES["n_red"],
+    config.VAR_INDICES["red_unit_type"],
+]
+TERRAIN_INDICES = [
+    config.VAR_INDICES["p_urban"],
+    config.VAR_INDICES["p_rough"],
+    config.VAR_INDICES["p_marsh"],
+]
+UNIT_TYPE_INDICES = [
+    config.VAR_INDICES["blue_unit_type"],
+    config.VAR_INDICES["red_unit_type"],
+]
+AI_INDEX = config.VAR_INDICES["red_ai"]
+PHASE_INDEX = config.VAR_INDICES["max_phases"]
 
 
 if __name__ == "__main__":
-    # Quick test
-    d = {"n_blue": 3, "blue_side": "east"}
-    u = {"n_red": 3, "red_ai": "pass-agg", "max_phases": 10,
-         "p_urban": 0.1, "p_rough": 0.1, "p_marsh": 0.05,
-         "scenario_seed": 42}
-    print("Testing evaluator...")
-    result = evaluate(d, u, n_seeds=2)
+    x = {
+        "n_blue": 3,
+        "blue_side": "east",
+        "blue_unit_type": "infantry",
+        "n_red": 3,
+        "red_ai": "pass-agg",
+        "max_phases": 10,
+        "p_urban": 0.1,
+        "p_rough": 0.1,
+        "p_marsh": 0.05,
+        "red_unit_type": "infantry",
+    }
+    result = evaluate(x, n_seeds=2)
     print(f"Score: {result['mean']:.2f} +/- {result['std']:.2f}")
     print(f"Individual scores: {result['scores']}")
