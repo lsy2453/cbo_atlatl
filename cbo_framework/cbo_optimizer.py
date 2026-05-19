@@ -101,12 +101,15 @@ class CBOOptimizer:
         self.gp.fit(X, y)
 
         candidates = generate_x_candidates(self.n_candidates, self.rng)
-        idx, ei = select_ei_candidate(self.gp, candidates, self.y_observed)
+        idx, acq_values, acq_name = select_ei_candidate(
+            self.gp, candidates, self.y_observed
+        )
         x_vars, score, result = self._evaluate_point(candidates[idx])
 
         print(
             f"  iter {iteration:2d}: {self._format_x(x_vars)} | "
-            f"y={score:7.1f} | EI={ei[idx]:.3f} | best={self.best_y:.1f}"
+            f"y={score:7.1f} | {acq_name}={acq_values[idx]:.3f} | "
+            f"best={self.best_y:.1f}"
         )
 
     def optimize(self):
@@ -208,6 +211,10 @@ class CBOOptimizer:
             "best_x": self.best_x,
             "best_y": float(self.best_y),
             "n_evaluations": len(self.y_observed),
+            "n_initial": self.n_initial,
+            "n_iterations": self.n_iterations,
+            "n_candidates": self.n_candidates,
+            "blue_ai": config.BLUE_AI,
             "all_scores": [float(s) for s in self.y_observed],
             "all_x": self.x_history,
         }

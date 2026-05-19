@@ -21,7 +21,17 @@ Thumbs.db
 results.json
 comparison_results.json
 smoke_results.json
+qwen_results*.json
+qwen_small_results.json
+qwen_smoke_results.json
+passagg_results*.json
+benchmark_results/
+figures/
 paper_atlatl.txt
+llm_cache*.jsonl
+.env
+http_server.out
+http_server.err
 *.log
 
 # Local archives and packaged snapshots

@@ -1,135 +1,121 @@
 """
 LLM-based AI agent for Atlatl.
-Uses Claude API to make tactical decisions based on game state.
 
-This is the third AI category for CBO analysis:
-  1. Rule-based (pass-agg): deterministic heuristics
-  2. Neural network (Pascal): learned from training data
-  3. LLM (this): general reasoning, zero-shot
+The agent implements the same process(message) interface as the bundled Atlatl
+heuristic AIs. It supports:
 
-The LLM receives the full game state as structured text and reasons
-about the best action. Its failure modes are fundamentally different:
-- May misunderstand spatial hex relationships
-- May over/under-value certain terrain or unit types
-- May exhibit inconsistent strategies across similar states
-- Decision quality depends on prompt framing
+- mock: deterministic local fallback for tests
+- qwen/openai-compatible: DashScope Qwen or any OpenAI-compatible endpoint
+
+Configure Qwen with environment variables, never hard-code API keys:
+
+    LLM_API_KEY      required for qwen/openai-compatible
+                     or DASHSCOPE_API_KEY for DashScope/Qwen
+    LLM_BASE_URL     optional, defaults to DashScope compatible-mode endpoint
+    LLM_MODEL        optional, defaults to qwen-plus
+    LLM_CACHE_PATH   optional, defaults to cbo_framework/llm_cache.jsonl
 """
 
+import hashlib
 import json
-import sys
 import os
+import random
+import sys
+import urllib.error
+import urllib.request
 
 sys.path.append(os.path.join(os.path.dirname(__file__),
-                "..", "atlatl-public-master", "server"))
+                             "..", "atlatl-public-master", "server"))
 
 import map as atlatl_map
 import unit as atlatl_unit
-import status
 
-
-# ============================================================
-# Option 1: Use Anthropic API (requires API key)
-# ============================================================
 try:
-    import anthropic
-    HAS_ANTHROPIC = True
-except ImportError:
-    HAS_ANTHROPIC = False
-
-# ============================================================
-# Option 2: Use OpenAI-compatible API (e.g., local LLM)
-# ============================================================
-try:
-    import openai
+    from openai import OpenAI
     HAS_OPENAI = True
 except ImportError:
+    OpenAI = None
     HAS_OPENAI = False
 
 
-SYSTEM_PROMPT = """You are a tactical AI commanding Blue forces in a hex-grid wargame.
+DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_QWEN_MODEL = "qwen-plus"
 
-GAME RULES:
-- Turn-based: Blue and Red alternate. Each unit gets one action per phase.
-- Actions: move to adjacent hex, fire at enemy in range, or pass.
-- Unit types: infantry (range 1, moves 1 hex), armor (range 1, moves 1-2),
-  mechanized infantry (range 1, moves 1-2), artillery (range 2, moves 1-2).
-- Terrain effects on DEFENDER: urban/rough = 0.5x damage to infantry;
-  marsh = 2x damage to armor/mechinf/artillery. Clear = no modifier.
-- Mobility: infantry moves 1 hex on any terrain; armor/mechinf move 2 on clear,
-  1 on rough/marsh/urban; artillery cannot enter marsh.
-- Damage = attacker_strength * firepower_table * terrain_multiplier * 0.5
-- Unit becomes ineffective below 50% strength.
-- Score: +1 per red strength destroyed, -2 per blue strength lost,
-  +/- city_score per phase for each city controlled.
 
-STRATEGY GUIDANCE:
-- Prioritize force preservation (losing blue costs 2x vs killing red 1x).
-- Capture cities for ongoing score accumulation.
-- Use terrain defensively (urban/rough halves damage to infantry).
-- Concentrate fire on weak targets to get kills.
-- Avoid exposing units to multiple enemies.
+SYSTEM_PROMPT = """You are a tactical AI commanding one side in a hex-grid wargame.
 
-Respond with ONLY a valid JSON action object. Examples:
-  {"type": "move", "mover": "blue 0", "destination": "hex-2-3"}
-  {"type": "fire", "source": "blue 0", "target": "red 1"}
-  {"type": "pass"}
+Rules:
+- Turn-based: Blue and Red alternate. Each surviving unit gets one action per phase.
+- Legal actions are exactly the JSON objects supplied by the user.
+- Actions include pass, move, or fire.
+- Infantry has range 1 and stable movement across clear/rough/marsh/urban terrain.
+- Armor and mechanized infantry move faster on clear terrain but slower on rough,
+  marsh, and urban terrain.
+- Artillery has range 2 but cannot enter marsh.
+- Urban and rough terrain reduce damage against infantry. Marsh increases damage
+  against armor, mechanized infantry, and artillery.
+- Score is from Blue's perspective: Blue gains points for Red losses and loses
+  twice as many points for Blue losses. City control also accumulates per phase.
+
+Choose one tactically reasonable legal action. Preserve friendly strength, exploit
+range and terrain, and avoid moving into unsupported contact.
+
+Respond with ONLY one valid JSON action object copied from the supplied legal actions.
+Do not include reasoning, markdown, or extra text.
 """
 
 
-def format_game_state(obs, map_data, role):
-    """Convert Atlatl observation to readable text for LLM."""
-    lines = []
-    lines.append(f"=== GAME STATE (you are {role.upper()}) ===")
+def format_game_state(obs, role):
+    """Convert Atlatl observation to compact text for the LLM."""
+    lines = [f"ROLE: {role}"]
+    status = obs.get("status", {})
+    lines.append(
+        f"phase={status.get('phaseCount')} score={status.get('score')} "
+        f"on_move={status.get('onMove')}"
+    )
 
-    st = obs.get("status", {})
-    lines.append(f"Phase: {st.get('phaseCount', '?')} | "
-                 f"Score: {st.get('score', '?')} | "
-                 f"On move: {st.get('onMove', '?')}")
+    city_owner = status.get("cityOwner", {})
+    if city_owner:
+        lines.append("cities=" + json.dumps(city_owner, sort_keys=True))
 
-    # Map info
-    cities = st.get("cityOwner", {})
-    if cities:
-        city_str = ", ".join(f"{cid}({owner})" for cid, owner in cities.items())
-        lines.append(f"Cities: {city_str}")
-
-    # Units
-    lines.append("\nYOUR UNITS:")
+    friendly = []
+    enemy = []
     for u in obs.get("units", []):
-        if u["faction"] == role and not u.get("ineffective", False):
-            status_str = "can_move" if u.get("canMove") else "already_moved"
-            lines.append(f"  {u['faction']} {u['longName']} ({u['type']}) "
-                        f"at {u.get('hex', '?')} "
-                        f"str={u.get('currentStrength', '?')} "
-                        f"[{status_str}]")
+        if u.get("ineffective", False):
+            continue
+        unit_line = (
+            f"{u.get('faction')} {u.get('longName')} type={u.get('type')} "
+            f"hex={u.get('hex')} str={u.get('currentStrength')} "
+            f"canMove={u.get('canMove')}"
+        )
+        if u.get("faction") == role:
+            friendly.append(unit_line)
+        elif u.get("hex") != "fog":
+            enemy.append(unit_line)
 
-    lines.append("\nENEMY UNITS:")
-    for u in obs.get("units", []):
-        if u["faction"] != role and not u.get("ineffective", False):
-            hex_loc = u.get("hex", "?")
-            if hex_loc == "fog":
-                continue
-            lines.append(f"  {u['faction']} {u['longName']} ({u['type']}) "
-                        f"at {hex_loc} "
-                        f"str={u.get('currentStrength', '?')}")
-
-    # Available actions hint
-    lines.append("\nChoose ONE action for ONE of your units that can_move.")
-
+    lines.append("FRIENDLY:")
+    lines.extend(f"  {line}" for line in friendly)
+    lines.append("ENEMY:")
+    lines.extend(f"  {line}" for line in enemy)
     return "\n".join(lines)
 
 
-def parse_llm_response(response_text, legal_actions):
-    """
-    Parse LLM response into a valid Atlatl action.
-    Falls back to pass if parsing fails.
-    """
-    # Try to extract JSON from response
-    text = response_text.strip()
+def _is_legal(action, legal_actions):
+    """Check if action exactly matches any legal action by required keys."""
+    if not isinstance(action, dict):
+        return False
+    for legal in legal_actions:
+        if all(action.get(key) == value for key, value in legal.items()):
+            return True
+    return False
 
-    # Handle markdown code blocks
+
+def parse_llm_response(response_text, legal_actions):
+    """Parse LLM text into a legal Atlatl action, falling back to pass."""
+    text = (response_text or "").strip()
+
     if "```" in text:
-        parts = text.split("```")
-        for part in parts:
+        for part in text.split("```"):
             part = part.strip()
             if part.startswith("json"):
                 part = part[4:].strip()
@@ -137,234 +123,244 @@ def parse_llm_response(response_text, legal_actions):
                 text = part
                 break
 
-    # Find JSON object
     start = text.find("{")
     end = text.rfind("}") + 1
     if start >= 0 and end > start:
         try:
             action = json.loads(text[start:end])
-            # Validate against legal actions
             if _is_legal(action, legal_actions):
                 return action
         except json.JSONDecodeError:
             pass
 
-    # Fallback: pass
+    for action in legal_actions:
+        if action.get("type") == "pass":
+            return action
     return {"type": "pass"}
 
 
-def _is_legal(action, legal_actions):
-    """Check if action matches any legal action."""
-    for legal in legal_actions:
-        match = True
-        for key in legal:
-            if key not in action or action[key] != legal[key]:
-                match = False
-                break
-        if match:
-            return True
-    return False
+class JsonlActionCache:
+    """Small persistent cache keyed by role, state text, and legal actions."""
+
+    def __init__(self, path):
+        self.path = path
+        self.items = {}
+        self._load()
+
+    def _load(self):
+        if not self.path or not os.path.exists(self.path):
+            return
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    self.items[row["key"]] = row["action"]
+                except (KeyError, json.JSONDecodeError):
+                    continue
+
+    def make_key(self, role, state_text, legal_actions, model):
+        payload = {
+            "role": role,
+            "state": state_text,
+            "legal": legal_actions,
+            "model": model,
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get(self, key):
+        return self.items.get(key)
+
+    def set(self, key, action):
+        if not self.path:
+            return
+        self.items[key] = action
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"key": key, "action": action},
+                               ensure_ascii=False) + "\n")
 
 
 class LLM_AI:
     """
-    LLM-based Atlatl AI agent.
+    LLM-driven Atlatl AI.
 
-    Supports multiple backends:
-    - "claude": Anthropic Claude API
-    - "openai": OpenAI-compatible API (works with local LLMs)
-    - "mock": Deterministic mock for testing without API
+    backend values:
+    - mock
+    - qwen
+    - openai-compatible
     """
 
     def __init__(self, role, kwargs=None):
-        if kwargs is None:
-            kwargs = {}
+        kwargs = kwargs or {}
         self.role = role
         self.mapData = None
         self.unitData = None
         self.param = None
-        self.backend = kwargs.get("backend", "mock")
-        self.model = kwargs.get("model", "claude-sonnet-4-20250514")
-        self.api_key = kwargs.get("api_key", os.environ.get("ANTHROPIC_API_KEY"))
-        self.temperature = kwargs.get("temperature", 0.3)
         self.call_count = 0
 
-        # Initialize API client
-        if self.backend == "claude" and HAS_ANTHROPIC and self.api_key:
-            self.client = anthropic.Anthropic(api_key=self.api_key)
-        elif self.backend == "openai" and HAS_OPENAI:
-            self.client = openai.OpenAI(
-                api_key=kwargs.get("openai_key", os.environ.get("OPENAI_API_KEY")),
-                base_url=kwargs.get("base_url", None)  # For local LLMs
-            )
-        else:
-            self.client = None
-            if self.backend != "mock":
-                print(f"Warning: {self.backend} backend unavailable, using mock")
+        self.backend = kwargs.get("backend", "mock")
+        if self.backend in ("openai", "dashscope"):
+            self.backend = "openai-compatible"
+
+        self.temperature = float(kwargs.get(
+            "temperature", os.environ.get("LLM_TEMPERATURE", 0.1)
+        ))
+        self.max_tokens = int(kwargs.get(
+            "max_tokens", os.environ.get("LLM_MAX_TOKENS", 200)
+        ))
+        self.model = kwargs.get("model") or os.environ.get(
+            "LLM_MODEL", DEFAULT_QWEN_MODEL
+        )
+        self.base_url = kwargs.get("base_url") or os.environ.get(
+            "LLM_BASE_URL", DEFAULT_QWEN_BASE_URL
+        )
+        self.api_key = (
+            kwargs.get("api_key")
+            or os.environ.get("LLM_API_KEY")
+            or os.environ.get("DASHSCOPE_API_KEY")
+        )
+        cache_path = kwargs.get("cache_path") or os.environ.get(
+            "LLM_CACHE_PATH",
+            os.path.join(os.path.dirname(__file__), "llm_cache.jsonl"),
+        )
+        self.cache = JsonlActionCache(cache_path)
+
+        self.client = None
+        if self.backend in ("qwen", "openai-compatible"):
+            if HAS_OPENAI and self.api_key:
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            elif self.api_key:
+                self.client = "raw-http"
+            else:
+                print("Warning: LLM backend unavailable; falling back to mock. "
+                      "Set LLM_API_KEY to use Qwen.")
                 self.backend = "mock"
 
-    def _call_llm(self, state_text, legal_actions):
-        """Call LLM and return action."""
-        legal_str = json.dumps(legal_actions[:10], indent=1)  # Show some examples
-        prompt = (f"{state_text}\n\nLegal actions (sample):\n{legal_str}\n\n"
-                  f"Choose the best action. Respond with ONLY a JSON object.")
-
-        if self.backend == "claude":
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=200,
-                temperature=self.temperature,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.content[0].text
-
-        elif self.backend == "openai":
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=200,
-                temperature=self.temperature,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            return response.choices[0].message.content
-
-        else:  # mock
-            return self._mock_decision(legal_actions)
-
     def _mock_decision(self, legal_actions):
-        """
-        Mock LLM: simple heuristic that mimics LLM-like behavior.
-        Prioritizes: fire > move toward enemy/city > pass.
-        More "thoughtful" than pass-agg but less optimal.
-        Introduces LLM-like failure modes:
-        - Sometimes ignores terrain advantages
-        - Occasionally over-commits to city capture
-        - May split forces instead of concentrating
-        """
-        import random
+        """Deterministic low-cost fallback for local tests."""
         random.seed(self.call_count)
         self.call_count += 1
-
-        fire_actions = [a for a in legal_actions if a["type"] == "fire"]
-        move_actions = [a for a in legal_actions if a["type"] == "move"]
-
+        fire_actions = [a for a in legal_actions if a.get("type") == "fire"]
+        move_actions = [a for a in legal_actions if a.get("type") == "move"]
         if fire_actions:
-            # LLM-like: usually picks the best target but sometimes wrong
-            if random.random() < 0.8:
-                return json.dumps(fire_actions[0])
-            else:
-                return json.dumps(random.choice(fire_actions))
-
+            return fire_actions[0]
         if move_actions:
-            # LLM-like: tends to move toward cities (over-values them)
-            # but sometimes makes spatial reasoning errors
-            if random.random() < 0.7:
-                # Move toward city if possible, otherwise random
-                city_moves = []
-                for a in move_actions:
-                    dest = a["destination"]
-                    if self.mapData and dest in self.mapData.hexIndex:
-                        if self.mapData.hexIndex[dest].terrain == "urban":
-                            city_moves.append(a)
-                if city_moves:
-                    return json.dumps(random.choice(city_moves))
+            return random.choice(move_actions)
+        return {"type": "pass"}
 
-            return json.dumps(random.choice(move_actions))
+    def _call_openai_compatible(self, state_text, legal_actions):
+        legal_text = json.dumps(legal_actions, ensure_ascii=False, indent=1)
+        user_prompt = (
+            f"{state_text}\n\n"
+            f"Legal actions:\n{legal_text}\n\n"
+            "Return exactly one legal action JSON object."
+        )
+        if self.client == "raw-http":
+            return self._call_openai_compatible_raw(user_prompt)
 
-        return json.dumps({"type": "pass"})
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return response.choices[0].message.content
+
+    def _call_openai_compatible_raw(self, user_prompt):
+        endpoint = self.base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        parsed = json.loads(body)
+        return parsed["choices"][0]["message"]["content"]
+
+    def _choose_action(self, state_text, legal_actions):
+        if self.backend == "mock":
+            return self._mock_decision(legal_actions)
+
+        key = self.cache.make_key(self.role, state_text, legal_actions, self.model)
+        cached = self.cache.get(key)
+        if cached is not None and _is_legal(cached, legal_actions):
+            return cached
+
+        try:
+            response_text = self._call_openai_compatible(state_text, legal_actions)
+            action = parse_llm_response(response_text, legal_actions)
+        except Exception as exc:
+            print(f"Warning: LLM call failed ({exc}); using pass fallback.")
+            action = parse_llm_response("", legal_actions)
+
+        self.cache.set(key, action)
+        return action
 
     def process(self, message, response_fn=None):
-        """Process Atlatl message and return action."""
-        msgD = json.loads(message)
+        """Process Atlatl JSON message and return an Atlatl action wrapper."""
+        msg = json.loads(message)
 
-        if msgD['type'] == "parameters":
-            self.param = msgD['parameters']
+        if msg["type"] == "parameters":
+            self.param = msg["parameters"]
             self.mapData = atlatl_map.MapData()
             self.unitData = atlatl_unit.UnitData()
-            atlatl_map.fromPortable(self.param['map'], self.mapData)
-            atlatl_unit.fromPortable(self.param['units'], self.unitData,
+            atlatl_map.fromPortable(self.param["map"], self.mapData)
+            atlatl_unit.fromPortable(self.param["units"], self.unitData,
                                      self.mapData)
             return json.dumps({"type": "role-request", "role": self.role})
 
-        elif msgD['type'] == 'observation':
-            obs = msgD['observation']
-            if (not obs['status']['isTerminal'] and
-                    obs['status']['onMove'] == self.role):
+        if msg["type"] == "observation":
+            obs = msg["observation"]
+            status = obs["status"]
+            if status["isTerminal"] or status["onMove"] != self.role:
+                return None
+            if status["setupMode"]:
+                return json.dumps({"type": "action", "action": {"type": "pass"}})
 
-                if obs['status']['setupMode']:
-                    return json.dumps({"type": "action",
-                                       "action": {"type": "pass"}})
+            for unit_obs in obs["units"]:
+                uid = unit_obs["faction"] + " " + unit_obs["longName"]
+                if uid in self.unitData.unitIndex:
+                    unit_obj = self.unitData.unitIndex[uid]
+                    unit_obj.partialObsUpdate(unit_obs, self.unitData, self.mapData)
 
-                # Update unit positions
-                for unitObs in obs['units']:
-                    uid = unitObs['faction'] + " " + unitObs['longName']
-                    if uid in self.unitData.unitIndex:
-                        un = self.unitData.unitIndex[uid]
-                        un.partialObsUpdate(unitObs, self.unitData,
-                                           self.mapData)
+            from game import Game
+            game = Game(self.param)
+            state = {"units": obs["units"], "status": obs["status"]}
+            legal_actions = game.legal_actions(state)
+            state_text = format_game_state(obs, self.role)
+            action = self._choose_action(state_text, legal_actions)
+            return json.dumps({"type": "action", "action": action})
 
-                # Get legal actions
-                from game import Game
-                game = Game(self.param)
-                state = {"units": obs["units"], "status": obs["status"]}
-                legal = game.legal_actions(state)
-
-                # Format state for LLM
-                state_text = format_game_state(obs, self.mapData, self.role)
-
-                # Call LLM
-                llm_response = self._call_llm(state_text, legal)
-
-                # Parse response
-                action = parse_llm_response(llm_response, legal)
-
-                return json.dumps({"type": "action", "action": action})
-
-        elif msgD['type'] == 'reset':
+        if msg["type"] == "reset":
             return None
 
         return None
 
 
-# ============================================================
-# Register with Atlatl evaluator
-# ============================================================
-AI = LLM_AI  # For compatibility with Atlatl AI registry
-
-
-if __name__ == "__main__":
-    """Test the LLM AI standalone."""
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__),
-                    "..", "atlatl-public-master", "server"))
-
-    from atlatl_evaluator import create_scenario, run_game
-
-    # Test with mock backend (no API key needed)
-    print("Testing LLM AI (mock backend)...")
-
-    scenario = create_scenario(
-        n_blue=3, blue_side="east", n_red=3,
-        max_phases=10, p_urban=0.1, p_rough=0.1,
-        p_marsh=0.05, scenario_seed=42
-    )
-
-    # Monkey-patch the evaluator to use LLM AI
-    import atlatl_evaluator
-    original_create_ai = atlatl_evaluator._create_ai
-
-    def patched_create_ai(ai_name, role):
-        if ai_name == "llm":
-            return LLM_AI(role, {"backend": "mock"})
-        return original_create_ai(ai_name, role)
-
-    atlatl_evaluator._create_ai = patched_create_ai
-
-    score = run_game(scenario, "llm", "pass-agg")
-    print(f"LLM (blue) vs pass-agg (red): score = {score}")
-
-    score2 = run_game(scenario, "pass-agg", "llm")
-    print(f"pass-agg (blue) vs LLM (red): score = {score2}")
+AI = LLM_AI

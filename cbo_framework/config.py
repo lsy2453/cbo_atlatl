@@ -23,6 +23,7 @@ ATLATL_SERVER_PATH = os.path.abspath(
 
 SIDE_CATEGORIES = ["north", "south", "east", "west"]
 AI_CATEGORIES = ["passive", "shootback", "pass-agg", "agg"]
+OPTIONAL_LLM_AI_CATEGORIES = ["llm-qwen"]
 UNIT_TYPE_CATEGORIES = ["infantry", "mechinf", "armor", "artillery"]
 
 SCENARIO_VARS = {

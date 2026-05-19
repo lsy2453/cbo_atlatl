@@ -18,7 +18,7 @@ from scipy.spatial.distance import cdist
 class RBFKernel:
     """Standard anisotropic RBF kernel over the encoded scenario vector."""
 
-    def __init__(self, lengthscale=None, variance=200.0, noise_var=25.0):
+    def __init__(self, lengthscale=None, variance=1.0, noise_var=1e-4):
         self.lengthscale = lengthscale
         self.variance = variance
         self.noise_var = noise_var
@@ -42,6 +42,7 @@ class CausalGP:
         self.X_train = None
         self.y_train = None
         self.y_mean = 0.0
+        self.y_scale = 1.0
         self.L = None
         self.alpha = None
 
@@ -49,7 +50,10 @@ class CausalGP:
         self.X_train = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
         self.y_mean = float(np.mean(y))
-        self.y_train = y - self.y_mean
+        self.y_scale = float(np.std(y))
+        if self.y_scale < 1e-8:
+            self.y_scale = 1.0
+        self.y_train = (y - self.y_mean) / self.y_scale
         K = self.kernel(self.X_train, self.X_train)
         K += (self.kernel.noise_var + 1e-6) * np.eye(len(y))
         self.L = cho_factor(K, lower=True, check_finite=False)
@@ -62,10 +66,12 @@ class CausalGP:
         X_new = np.atleast_2d(X_new).astype(np.float64)
         Ks = self.kernel(X_new, self.X_train)
         Kss = self.kernel(X_new, X_new)
-        mu = Ks @ self.alpha + self.y_mean
+        mu_std = Ks @ self.alpha
         v = cho_solve(self.L, Ks.T, check_finite=False)
-        var = np.diag(Kss) - np.sum(Ks * v.T, axis=1)
-        return mu, np.maximum(var, 1e-6)
+        var_std = np.diag(Kss) - np.sum(Ks * v.T, axis=1)
+        mu = mu_std * self.y_scale + self.y_mean
+        var = np.maximum(var_std, 1e-8) * (self.y_scale ** 2)
+        return mu, var
 
     def do_marginal(self, fixed_index, fixed_value, reference_samples):
         """

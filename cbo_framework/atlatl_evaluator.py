@@ -149,17 +149,34 @@ def _create_ai(ai_name, role):
     if ai_name.startswith("llm"):
         from llm_ai import LLM_AI
         kwargs = {"backend": "mock"}
-        if ai_name == "llm-claude":
-            kwargs = {"backend": "claude", "model": "claude-sonnet-4-20250514"}
-        elif ai_name == "llm-openai":
-            kwargs = {"backend": "openai"}
+        if ai_name in ("llm-qwen", "llm-dashscope"):
+            kwargs = {"backend": "qwen"}
+        elif ai_name in ("llm-openai", "llm-compatible"):
+            kwargs = {"backend": "openai-compatible"}
         return LLM_AI(role, kwargs)
+    if ai_name == "pascal":
+        from ai.dl_alpha_beta import AI
+        return AI(role, {
+            "debug": False,
+            "neuralNet": "ai/pass-v-pass-g3",
+            "depthLimit": "1",
+        })
+    if ai_name in ("pass-agg-fp", "pass-agg-fog", "field", "dijkstra",
+                   "mcts1k", "burtplus", "stomp"):
+        from airegistry import ai_registry
+        cls, kwargs = ai_registry[ai_name]
+        return cls(role, kwargs)
     raise ValueError(f"Unknown AI: {ai_name}")
 
 
 def run_game(scenario, blue_ai_name, red_ai_name):
     """Run a single Atlatl game synchronously and return the Blue score."""
     game = Game(scenario)
+    try:
+        import current_game_access
+        current_game_access.server = types.SimpleNamespace(game=game)
+    except Exception:
+        pass
     state = game.initial_state()
 
     blue_ai = _create_ai(blue_ai_name, "blue")

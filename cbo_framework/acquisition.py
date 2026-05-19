@@ -29,10 +29,24 @@ def expected_improvement_min(gp, x_candidates, y_observed, xi=0.01):
     return ei
 
 
-def select_ei_candidate(gp, x_candidates, y_observed, xi=0.01):
+def lower_confidence_bound_min(gp, x_candidates, kappa=2.0):
+    """LCB acquisition for minimization: lower is better."""
+    mu, var = gp.predict(x_candidates)
+    sigma = np.sqrt(np.maximum(var, 1e-12))
+    return mu - kappa * sigma
+
+
+def select_ei_candidate(gp, x_candidates, y_observed, xi=0.01, lcb_kappa=2.0):
     ei = expected_improvement_min(gp, x_candidates, y_observed, xi=xi)
-    idx = int(np.argmax(ei))
-    return idx, ei
+    max_ei = float(np.max(ei))
+    if np.isfinite(max_ei) and max_ei > 1e-10:
+        idx = int(np.argmax(ei))
+        return idx, ei, "EI"
+
+    lcb = lower_confidence_bound_min(gp, x_candidates, kappa=lcb_kappa)
+    idx = int(np.argmin(lcb))
+    # Return a positive score for display while preserving the old shape.
+    return idx, -lcb, "LCB"
 
 
 def _sample_terrain_probs(rng):
@@ -64,7 +78,7 @@ def generate_x_candidates(n_samples, rng=None):
             "blue_side": config.SIDE_CATEGORIES[int(rng.randint(0, 4))],
             "blue_unit_type": config.UNIT_TYPE_CATEGORIES[int(rng.randint(0, 4))],
             "n_red": int(rng.randint(1, 5)),
-            "red_ai": config.AI_CATEGORIES[int(rng.randint(0, 4))],
+            "red_ai": config.AI_CATEGORIES[int(rng.randint(0, len(config.AI_CATEGORIES)))],
             "max_phases": int(rng.randint(6, 21)),
             "red_unit_type": config.UNIT_TYPE_CATEGORIES[int(rng.randint(0, 4))],
         }

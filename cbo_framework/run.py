@@ -46,7 +46,18 @@ if __name__ == "__main__":
                         help="optimizer random seed")
     parser.add_argument("--output", type=str, default="results.json",
                         help="output JSON file")
+    parser.add_argument("--blue_ai", type=str, default=config.BLUE_AI,
+                        help="fixed Blue AI policy, e.g. pass-agg or llm-qwen")
+    parser.add_argument("--include_llm_red", action="store_true",
+                        help="include llm-qwen as a Red AI candidate")
     args = parser.parse_args()
+
+    config.BLUE_AI = args.blue_ai
+    if args.include_llm_red:
+        for ai_name in config.OPTIONAL_LLM_AI_CATEGORIES:
+            if ai_name not in config.AI_CATEGORIES:
+                config.AI_CATEGORIES.append(ai_name)
+        config.SCENARIO_VARS["red_ai"]["categories"] = config.AI_CATEGORIES
 
     print(f"Atlatl path: {ATLATL_SERVER}")
     print("\nConfiguration:")
@@ -56,6 +67,7 @@ if __name__ == "__main__":
     print(f"  eval seeds:      {args.n_seeds}")
     print(f"  random seed:     {args.seed}")
     print(f"  fixed Blue AI:   {config.BLUE_AI}")
+    print(f"  Red AI choices:  {config.AI_CATEGORIES}")
 
     optimizer = CBOOptimizer(
         n_initial=args.n_initial,
